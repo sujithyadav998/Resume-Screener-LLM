@@ -1,15 +1,11 @@
 from flask import Flask, request, render_template
 from PyPDF2 import PdfReader
 import re
-import pickle
+from anthropic import Anthropic
+import os
+import google.generativeai as genai
 
 app = Flask(__name__)
-
-# Load models===========================================================================================================
-rf_classifier_categorization = pickle.load(open('models/rf_classifier_categorization.pkl', 'rb'))
-tfidf_vectorizer_categorization = pickle.load(open('models/tfidf_vectorizer_categorization.pkl', 'rb'))
-rf_classifier_job_recommendation = pickle.load(open('models/rf_classifier_job_recommendation.pkl', 'rb'))
-tfidf_vectorizer_job_recommendation = pickle.load(open('models/tfidf_vectorizer_job_recommendation.pkl', 'rb'))
 
 # Clean resume==========================================================================================================
 def cleanResume(txt):
@@ -21,20 +17,6 @@ def cleanResume(txt):
     cleanText = re.sub(r'[^\x00-\x7f]', ' ', cleanText)
     cleanText = re.sub('\s+', ' ', cleanText)
     return cleanText
-
-# Prediction and Category Name
-def predict_category(resume_text):
-    resume_text = cleanResume(resume_text)
-    resume_tfidf = tfidf_vectorizer_categorization.transform([resume_text])
-    predicted_category = rf_classifier_categorization.predict(resume_tfidf)[0]
-    return predicted_category
-
-# Prediction and Category Name
-def job_recommendation(resume_text):
-    resume_text= cleanResume(resume_text)
-    resume_tfidf = tfidf_vectorizer_job_recommendation.transform([resume_text])
-    recommended_job = rf_classifier_job_recommendation.predict(resume_tfidf)[0]
-    return recommended_job
 
 def pdf_to_text(file):
     reader = PdfReader(file)
@@ -228,36 +210,97 @@ def extract_name_from_resume(text):
 # routes===============================================
 
 @app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/resume')
 def resume():
-    # Provide a simple UI to upload a resume
     return render_template("resume.html")
 
 @app.route('/pred', methods=['POST'])
 def pred():
-    # Process the PDF or TXT file and make prediction
     if 'resume' in request.files:
         file = request.files['resume']
+        job_description = request.form.get('job_description')
+        
         filename = file.filename
         if filename.endswith('.pdf'):
-            text = pdf_to_text(file)
+            resume_text = pdf_to_text(file)
         elif filename.endswith('.txt'):
-            text = file.read().decode('utf-8')
+            resume_text = file.read().decode('utf-8')
         else:
-            return render_template('resume.html', message="Invalid file format. Please upload a PDF or TXT file.")
+            return render_template('results.html', message="Invalid file format. Please upload a PDF or TXT file.")
 
-        predicted_category = predict_category(text)
-        recommended_job = job_recommendation(text)
-        phone = extract_contact_number_from_resume(text)
-        email = extract_email_from_resume(text)
+        # Extract information from resume
+        phone = extract_contact_number_from_resume(resume_text)
+        email = extract_email_from_resume(resume_text)
+        extracted_skills = extract_skills_from_resume(resume_text)
+        extracted_education = extract_education_from_resume(resume_text)
+        name = extract_name_from_resume(resume_text)
 
-        extracted_skills = extract_skills_from_resume(text)
-        extracted_education = extract_education_from_resume(text)
-        name = extract_name_from_resume(text)
+        # Get match analysis from Claude
+        try:
+            match_score, match_feedback = analyze_resume_match(resume_text, job_description)
+        except Exception as e:
+            match_score = "Error"
+            match_feedback = f"Unable to analyze the match: {str(e)}"
 
-        return render_template('resume.html', predicted_category=predicted_category,recommended_job=recommended_job,
-                               phone=phone,name=name,email=email,extracted_skills=extracted_skills,extracted_education=extracted_education)
+        # Changed template from resume.html to results.html
+        return render_template('results.html', 
+                            match_score=match_score,
+                            match_feedback=match_feedback,
+                            phone=phone,
+                            name=name,
+                            email=email,
+                            extracted_skills=extracted_skills,
+                            extracted_education=extracted_education,
+                            # Adding empty values for optional fields in the template
+                            predicted_category="",
+                            recommended_job="")
     else:
-        return render_template("resume.html", message="No resume file uploaded.")
+        return render_template("results.html", message="No resume file uploaded.")
+
+def analyze_resume_match(resume_text, job_description):
+    prompt = f"""You are an expert HR professional and recruiter. Analyze the match between the following resume and job description. 
+    Provide a match percent age and detailed feedback about the fit.
+
+    Job Description:
+    {job_description}
+
+    Resume:
+    {resume_text}
+
+    Provide your response in the following format:
+    Match Score: [percentage]
+    Feedback: [detailed analysis]
+    """
+   
+    # Configure Gemini
+    genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+    model = genai.GenerativeModel('gemini-pro')
+    
+    # Get response from Gemini
+    response = model.generate_content(prompt)
+   
+    # Parse the response
+    content = response.text
+    print("content:",content)
+    try:
+        # Extract match score - handle both "Match Score:" and "**Match Score:**" formats
+        match_score = re.search(r'\*?\*?Match Score:?\*?\*?\s*(\d+%)', content, re.IGNORECASE)
+        match_score = match_score.group(1) if match_score else "N/A"
+        
+        # Extract feedback - handle both "Feedback:" and "**Feedback:**" formats
+        feedback_match = re.search(r'\*?\*?Feedback:?\*?\*?\s*([\s\S]*)', content, re.IGNORECASE)
+        feedback = feedback_match.group(1).strip() if feedback_match else "Unable to analyze the match properly."
+        
+    except Exception as e:
+        print(f"Error parsing response: {str(e)}")
+        match_score = "N/A"
+        feedback = "Unable to analyze the match properly."
+
+    print(match_score,feedback)
+    return match_score, feedback
 
 if __name__ == '__main__':
     app.run(debug=True)
