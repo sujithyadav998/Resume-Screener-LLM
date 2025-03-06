@@ -4,6 +4,8 @@ import re
 from anthropic import Anthropic
 import os
 import google.generativeai as genai
+from openai import OpenAI
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
@@ -262,7 +264,7 @@ def pred():
 
 def analyze_resume_match(resume_text, job_description):
     prompt = f"""You are an expert HR professional and recruiter. Analyze the match between the following resume and job description. 
-    Provide a match percent age and detailed feedback about the fit.
+    Provide a match percentage and detailed feedback about the fit.
 
     Job Description:
     {job_description}
@@ -275,16 +277,24 @@ def analyze_resume_match(resume_text, job_description):
     Feedback: [detailed analysis]
     """
    
-    # Configure Gemini
-    genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-    model = genai.GenerativeModel('gemini-pro')
+    # Configure OpenAI
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     
-    # Get response from Gemini
-    response = model.generate_content(prompt)
+    # Get response from OpenAI
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are an expert HR professional and recruiter."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        max_tokens=1000
+    )
    
     # Parse the response
-    content = response.text
-    print("content:",content)
+    content = response.choices[0].message.content
+    print("content:", content)
+    
     try:
         # Extract match score - handle both "Match Score:" and "**Match Score:**" formats
         match_score = re.search(r'\*?\*?Match Score:?\*?\*?\s*(\d+%)', content, re.IGNORECASE)
@@ -299,8 +309,55 @@ def analyze_resume_match(resume_text, job_description):
         match_score = "N/A"
         feedback = "Unable to analyze the match properly."
 
-    print(match_score,feedback)
+    print(match_score, feedback)
     return match_score, feedback
+
+@app.route('/bulk-resume')
+def bulk_resume():
+    return render_template('bulk_resume.html')
+
+@app.route('/bulk-analyze', methods=['POST'])
+def bulk_analyze():
+    if 'resumes' not in request.files:
+        return render_template('bulk_resume.html', message="No files uploaded")
+    
+    files = request.files.getlist('resumes')
+    job_description = request.form.get('job_description')
+    
+    results = []
+    
+    for file in files:
+        if file.filename == '':
+            continue
+            
+        filename = secure_filename(file.filename)
+        
+        try:
+            # Read resume content
+            if filename.endswith('.pdf'):
+                resume_text = pdf_to_text(file)
+            elif filename.endswith('.txt'):
+                resume_text = file.read().decode('utf-8')
+            else:
+                continue
+                
+            # Analyze resume
+            match_score, match_feedback = analyze_resume_match(resume_text, job_description)
+            
+            results.append({
+                'filename': filename,
+                'match_score': match_score,
+                'feedback': match_feedback
+            })
+            
+        except Exception as e:
+            results.append({
+                'filename': filename,
+                'match_score': 'Error',
+                'feedback': f'Error analyzing resume: {str(e)}'
+            })
+    
+    return render_template('bulk_resume.html', results=results)
 
 if __name__ == '__main__':
     app.run(debug=True)
